@@ -14,7 +14,10 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.stream.Collectors;
@@ -135,20 +138,21 @@ public class ZkMetadataStore implements Closeable {
 
     public ShardMetadata electPrimary(int shardId, List<NodeInfo> liveNodes) {
         ShardMetadata metadata = shard(shardId);
-        Set<String> liveServing = liveNodes.stream()
-                .filter(node -> "SERVING".equalsIgnoreCase(node.replicaState))
-                .map(node -> node.nodeId)
-                .collect(Collectors.toSet());
+        Set<String> liveServing = liveServingNodeIds(liveNodes);
         if (metadata.primary != null && liveServing.contains(metadata.primary)) {
             return metadata;
         }
-        for (String replica : metadata.replicas) {
-            if (liveServing.contains(replica)) {
-                metadata.primary = replica;
-                metadata.term++;
-                updateShard(metadata);
-                return metadata;
-            }
+        List<String> liveReplicas = metadata.replicas.stream()
+                .filter(liveServing::contains)
+                .collect(Collectors.toList());
+        if (liveReplicas.isEmpty()) {
+            return metadata;
+        }
+        String previousPrimary = metadata.primary;
+        metadata.primary = chooseBalancedPrimary(liveReplicas, primaryCountsExcludingShard(shardId));
+        if (!Objects.equals(previousPrimary, metadata.primary)) {
+            metadata.term++;
+            updateShard(metadata);
         }
         return metadata;
     }
@@ -164,25 +168,69 @@ public class ZkMetadataStore implements Closeable {
             return shards();
         }
         List<ShardMetadata> updated = new ArrayList<>();
+        Map<Integer, List<String>> previousReplicas = new HashMap<>();
+        Map<Integer, String> previousPrimaries = new HashMap<>();
         for (ShardMetadata shard : shards()) {
+            previousReplicas.put(shard.shardId, new ArrayList<>(shard.replicas));
+            previousPrimaries.put(shard.shardId, shard.primary);
             List<String> replicas = new ArrayList<>();
             int replicaTarget = Math.min(replicationFactor, liveIds.size());
             for (int replica = 0; replica < replicaTarget; replica++) {
                 replicas.add(liveIds.get((shard.shardId + replica) % liveIds.size()));
             }
             replicas.sort(String::compareTo);
-            boolean changed = !replicas.equals(shard.replicas);
             shard.replicas = replicas;
-            if (shard.primary == null || !replicas.contains(shard.primary)) {
-                shard.primary = replicas.get(0);
-                shard.term++;
-            } else if (changed) {
+            updated.add(shard);
+        }
+        assignBalancedPrimaries(updated);
+        for (ShardMetadata shard : updated) {
+            boolean replicasChanged = !shard.replicas.equals(previousReplicas.get(shard.shardId));
+            boolean primaryChanged = !Objects.equals(shard.primary, previousPrimaries.get(shard.shardId));
+            if (replicasChanged || primaryChanged) {
                 shard.term++;
             }
             updateShard(shard);
-            updated.add(shard);
         }
         return updated;
+    }
+
+    private void assignBalancedPrimaries(List<ShardMetadata> shards) {
+        Map<String, Integer> primaryCounts = new HashMap<>();
+        shards.sort(Comparator.comparingInt(shard -> shard.shardId));
+        for (ShardMetadata shard : shards) {
+            if (shard.replicas.isEmpty()) {
+                shard.primary = null;
+                continue;
+            }
+            shard.primary = chooseBalancedPrimary(shard.replicas, primaryCounts);
+            primaryCounts.merge(shard.primary, 1, Integer::sum);
+        }
+    }
+
+    private String chooseBalancedPrimary(List<String> replicas, Map<String, Integer> primaryCounts) {
+        return replicas.stream()
+                .min(Comparator
+                        .comparingInt((String nodeId) -> primaryCounts.getOrDefault(nodeId, 0))
+                        .thenComparing(nodeId -> nodeId))
+                .orElse(replicas.get(0));
+    }
+
+    private Map<String, Integer> primaryCountsExcludingShard(int excludedShardId) {
+        Map<String, Integer> counts = new HashMap<>();
+        for (ShardMetadata shard : shards()) {
+            if (shard.shardId == excludedShardId || shard.primary == null) {
+                continue;
+            }
+            counts.merge(shard.primary, 1, Integer::sum);
+        }
+        return counts;
+    }
+
+    private Set<String> liveServingNodeIds(List<NodeInfo> liveNodes) {
+        return liveNodes.stream()
+                .filter(node -> "SERVING".equalsIgnoreCase(node.replicaState))
+                .map(node -> node.nodeId)
+                .collect(Collectors.toSet());
     }
 
     public void updateCommitIndex(int shardId, long commitIndex) {
