@@ -20,4 +20,4 @@ nodes
 rebalance
 metadata
 select count(*) from t;
-java -jar dis-minisql/target/dis-minisql-1.0.0.jar datanode ./config/cluster4.json node-d 
+java -jar dis-minisql/target/dis-minisql-1.0.0.jar datanode ./config/cluster4.json node-d --cli

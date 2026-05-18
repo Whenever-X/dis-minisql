@@ -116,6 +116,25 @@ int main(int argc, char **argv) {
     return 0;
   }
 
+  if (argc == 2 && std::string(argv[1]) == "--repl") {
+    std::string command;
+    while (std::getline(std::cin, command)) {
+      if (command.empty()) {
+        continue;
+      }
+      if (command.back() != ';') {
+        command.push_back(';');
+      }
+      auto result = ExecuteCommand(command, engine, syntax_tree_file_mgr, syntax_tree_id);
+      printf("\n__MINISQL_END__\n");
+      fflush(stdout);
+      if (result == DB_QUIT) {
+        break;
+      }
+    }
+    return 0;
+  }
+
   while (1) {
     // read from buffer
     InputCommand(cmd, buf_size);

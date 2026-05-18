@@ -7,13 +7,16 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+/**
+ * One-shot batch executor. Production DataNode path uses {@link MiniSqlEngine}.
+ */
 public class MiniSqlCli {
     private final Path binary;
     private final Path workDir;
@@ -36,7 +39,10 @@ public class MiniSqlCli {
             } finally {
                 deleteDirectory(execDir);
             }
-        } catch (IOException e) {
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             throw new IllegalStateException("Failed to start MiniSQL binary: " + binary, e);
         }
     }
@@ -45,7 +51,10 @@ public class MiniSqlCli {
         try {
             Files.createDirectories(execDir);
             return runBatch(execDir, replaySql, sql);
-        } catch (IOException e) {
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             throw new IllegalStateException("Failed to start MiniSQL binary: " + binary, e);
         }
     }

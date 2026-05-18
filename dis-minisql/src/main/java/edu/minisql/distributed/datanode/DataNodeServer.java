@@ -6,7 +6,7 @@ import edu.minisql.distributed.common.Jsons;
 import edu.minisql.distributed.common.SqlUtils;
 import edu.minisql.distributed.config.ClusterConfig;
 import edu.minisql.distributed.config.NodeConfig;
-import edu.minisql.distributed.minisql.MiniSqlCli;
+import edu.minisql.distributed.minisql.MiniSqlEngine;
 import edu.minisql.distributed.protocol.ExecuteRequest;
 import edu.minisql.distributed.protocol.ExecuteResponse;
 import edu.minisql.distributed.protocol.NodeInfo;
@@ -14,7 +14,6 @@ import edu.minisql.distributed.zk.ZkMetadataStore;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
@@ -34,14 +33,12 @@ public class DataNodeServer {
     private final ZkMetadataStore metadataStore;
     private final WalLog walLog;
     private final SnapshotManager snapshotManager;
-    private final MiniSqlCli miniSql;
+    private final MiniSqlEngine miniSqlEngine;
     private final Path dataDir;
+    private final Path miniSqlRuntimeDir;
     private final Set<Integer> shards = new HashSet<>();
     private volatile String replicaState = "RECOVERING";
     private SnapshotManifest snapshotManifest;
-    private Path cliSessionDir;
-    private long cliSessionWalSequence = -1;
-    private long cliSessionCompactedWal = -1;
 
     public DataNodeServer(ClusterConfig clusterConfig, String nodeId) {
         this.clusterConfig = clusterConfig;
@@ -50,10 +47,12 @@ public class DataNodeServer {
         this.metadataStore.initializeShards(clusterConfig);
         this.shards.addAll(metadataStore.shardsForNode(nodeId));
         this.dataDir = Path.of(nodeConfig.dataDir == null ? "data/" + nodeId : nodeConfig.dataDir);
+        this.miniSqlRuntimeDir = dataDir.resolve("minisql-runtime");
         this.walLog = new WalLog(dataDir);
         this.snapshotManager = new SnapshotManager(dataDir);
-        this.miniSql = new MiniSqlCli(Path.of(clusterConfig.minisqlBinary), dataDir, Duration.ofSeconds(30),
-                clusterConfig.defaultDatabase);
+        Path snapshotDatabases = dataDir.resolve("snapshots").resolve("current").resolve("databases");
+        this.miniSqlEngine = new MiniSqlEngine(Path.of(clusterConfig.minisqlBinary), miniSqlRuntimeDir,
+                snapshotDatabases, Duration.ofSeconds(30), clusterConfig.defaultDatabase);
         log("constructed cluster=%s zk=%s listen=%s:%d dataDir=%s minisql=%s initialShards=%s",
                 clusterConfig.clusterName, clusterConfig.zkConnect, nodeConfig.host, nodeConfig.port,
                 dataDir, clusterConfig.minisqlBinary, shards);
@@ -76,6 +75,8 @@ public class DataNodeServer {
         applyPendingWal();
         log("checking startup snapshot threshold");
         maybeSnapshot();
+        log("starting persistent MiniSQL engine");
+        syncEngineFull();
         replicaState = "SERVING";
         log("recovery complete, switching state to SERVING");
         register();
@@ -110,6 +111,7 @@ public class DataNodeServer {
             refreshShards();
             recoverFromPeers();
             applyPendingWal();
+            syncEngineFull();
             replicaState = "SERVING";
             register();
             log("admin refresh-shards completed state=%s shards=%s", replicaState, shards);
@@ -123,6 +125,7 @@ public class DataNodeServer {
                     .forEach(appliedSql::add);
             snapshotManifest = snapshotManager.createSnapshot(walLog.lastSequence(), currentShardLogIndexes(), appliedSql);
             walLog.compactThrough(walLog.lastSequence());
+            miniSqlEngine.invalidate();
             log("admin snapshot completed compactedWal=%d appliedSql=%d shardLogIndexes=%s",
                     snapshotManifest.lastCompactedWalSequence, appliedSql.size(), snapshotManifest.shardLogIndexes);
             HttpUtil.json(exchange, 200, snapshotManifest);
@@ -136,50 +139,7 @@ public class DataNodeServer {
     }
 
     public synchronized String executeLocalSql(String sql) {
-        String normalized = SqlUtils.normalize(sql);
-        ensureCliSession();
-        return miniSql.executeInDirectory(cliSessionDir, List.of(), normalized);
-    }
-
-    private void ensureCliSession() {
-        long walSequence = walLog.lastSequence();
-        long compactedWal = snapshotManifest == null ? 0 : snapshotManifest.lastCompactedWalSequence;
-        if (cliSessionDir != null
-                && cliSessionWalSequence == walSequence
-                && cliSessionCompactedWal == compactedWal
-                && Files.isDirectory(cliSessionDir)) {
-            return;
-        }
-        resetCliSession();
-        List<String> replay = replaySqlBefore(Long.MAX_VALUE);
-        if (!replay.isEmpty()) {
-            miniSql.executeInDirectory(cliSessionDir, replay, null);
-        }
-        cliSessionWalSequence = walSequence;
-        cliSessionCompactedWal = compactedWal;
-        debug("cli session ready wal=%d compactedWal=%d replayStatements=%d",
-                walSequence, compactedWal, replay.size());
-    }
-
-    private void resetCliSession() {
-        cliSessionDir = dataDir.resolve("cli-session");
-        try {
-            deleteCliSessionDir();
-            Files.createDirectories(cliSessionDir);
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to reset CLI session directory: " + cliSessionDir, e);
-        }
-    }
-
-    private void deleteCliSessionDir() throws IOException {
-        if (cliSessionDir == null || !Files.exists(cliSessionDir)) {
-            return;
-        }
-        try (var paths = Files.walk(cliSessionDir)) {
-            for (Path path : paths.sorted(Comparator.reverseOrder()).collect(Collectors.toList())) {
-                Files.deleteIfExists(path);
-            }
-        }
+        return runOnEngine(Long.MAX_VALUE, sql, walLog.lastSequence());
     }
 
     private synchronized ExecuteResponse execute(ExecuteRequest request) {
@@ -214,11 +174,13 @@ public class DataNodeServer {
         }
 
         long sequence = written == null ? walLog.lastSequence() : written.sequence;
-        List<String> replay = replaySqlBefore(written == null ? Long.MAX_VALUE : written.sequence);
-        log("miniSQL start requestId=%s replayStatements=%d currentSql=%s",
-                request.requestId, replay.size(), oneLine(sql));
-        String output = miniSql.execute(replay, sql);
-        log("miniSQL completed requestId=%s outputLines=%d", request.requestId, lineCount(output));
+        long sequenceExclusive = written == null ? Long.MAX_VALUE : written.sequence;
+        long appliedWalSequence = written == null ? walLog.lastSequence() : written.sequence;
+        log("miniSQL start requestId=%s sequenceExclusive=%d currentSql=%s engineReady=%s",
+                request.requestId, sequenceExclusive, oneLine(sql), miniSqlEngine.isReady());
+        String output = runOnEngine(sequenceExclusive, sql, appliedWalSequence);
+        log("miniSQL completed requestId=%s outputLines=%d engineWal=%d",
+                request.requestId, lineCount(output), miniSqlEngine.engineWalSequence());
         logMiniSqlOutput(request.requestId, output);
         if (written != null) {
             snapshotManifest = snapshotManager.markApplied(snapshotManifest, sequence, currentShardLogIndexes());
@@ -290,6 +252,7 @@ public class DataNodeServer {
                 peerState.snapshotManifest.shardLogIndexes,
                 peerState.snapshotSql);
         walLog.advanceLastSequence(peerState.snapshotManifest.lastCompactedWalSequence);
+        miniSqlEngine.invalidate();
         log("peer snapshot installed peer=%s compactedWal=%d shardLogIndexes=%s",
                 peerNodeId, snapshotManifest.lastCompactedWalSequence, snapshotManifest.shardLogIndexes);
     }
@@ -299,21 +262,79 @@ public class DataNodeServer {
     }
 
     private void applyPendingWal() {
-        List<String> pendingSql = walLog.pendingAfter(snapshotManifest.lastCompactedWalSequence).stream()
-                .map(entry -> entry.sql)
-                .collect(Collectors.toList());
-        if (!pendingSql.isEmpty()) {
-            log("applying pending WAL pendingStatements=%d compactedWal=%d", pendingSql.size(),
+        List<WalEntry> pending = walLog.pendingAfter(snapshotManifest.lastCompactedWalSequence);
+        if (!pending.isEmpty()) {
+            log("applying pending WAL pendingStatements=%d compactedWal=%d", pending.size(),
                     snapshotManifest.lastCompactedWalSequence);
-            List<String> replay = new ArrayList<>(snapshotManager.snapshotSql());
-            replay.addAll(pendingSql);
-            String output = miniSql.execute(replay, null);
-            logMiniSqlOutput("apply-pending-wal", output);
             snapshotManifest = snapshotManager.markApplied(snapshotManifest, walLog.lastSequence(), currentShardLogIndexes());
             log("pending WAL applied lastWal=%d shardLogIndexes=%s",
                     snapshotManifest.lastWalSequence, snapshotManifest.shardLogIndexes);
         } else {
             log("no pending WAL to apply after compactedWal=%d", snapshotManifest.lastCompactedWalSequence);
+        }
+    }
+
+    private void syncEngineFull() {
+        long compactedWal = snapshotManifest == null ? 0 : snapshotManifest.lastCompactedWalSequence;
+        List<String> replay = replaySqlBefore(Long.MAX_VALUE);
+        long replayThrough = walLog.readAll().stream()
+                .filter(entry -> entry.sequence > compactedWal)
+                .mapToLong(entry -> entry.sequence)
+                .max()
+                .orElse(compactedWal);
+        miniSqlEngine.resetAndReplay(replay, replayThrough, compactedWal);
+        miniSqlEngine.setEngineWalSequence(walLog.lastSequence());
+        log("persistent MiniSQL engine ready wal=%d compactedWal=%d replayStatements=%d runtimeDir=%s",
+                walLog.lastSequence(), compactedWal, replay.size(), miniSqlRuntimeDir);
+    }
+
+    private String runOnEngine(long sequenceExclusive, String sql, long appliedWalSequence) {
+        long compactedWal = snapshotManifest == null ? 0 : snapshotManifest.lastCompactedWalSequence;
+        try {
+            if (!miniSqlEngine.isReady() || miniSqlEngine.engineCompactedWal() != compactedWal) {
+                fullSyncEngine(sequenceExclusive);
+            } else {
+                catchUpWalBefore(sequenceExclusive);
+            }
+            String output = sql == null || sql.isBlank() ? "" : miniSqlEngine.executeStatement(sql);
+            miniSqlEngine.setEngineWalSequence(appliedWalSequence);
+            return output;
+        } catch (IllegalStateException failed) {
+            warn("MiniSQL engine resync after failure: %s", failed.getMessage());
+            fullSyncEngine(sequenceExclusive);
+            String output = sql == null || sql.isBlank() ? "" : miniSqlEngine.executeStatement(sql);
+            miniSqlEngine.setEngineWalSequence(appliedWalSequence);
+            return output;
+        }
+    }
+
+    private void fullSyncEngine(long sequenceExclusive) {
+        long compactedWal = snapshotManifest == null ? 0 : snapshotManifest.lastCompactedWalSequence;
+        List<String> replay = replaySqlBefore(sequenceExclusive);
+        long replayThrough = walLog.readAll().stream()
+                .filter(entry -> entry.sequence < sequenceExclusive)
+                .filter(entry -> entry.sequence > compactedWal)
+                .mapToLong(entry -> entry.sequence)
+                .max()
+                .orElse(compactedWal);
+        miniSqlEngine.resetAndReplay(replay, replayThrough, compactedWal);
+        debug("MiniSQL engine full sync replayStatements=%d replayThrough=%d compactedWal=%d",
+                replay.size(), replayThrough, compactedWal);
+    }
+
+    private void catchUpWalBefore(long sequenceExclusive) {
+        if (sequenceExclusive == Long.MAX_VALUE) {
+            sequenceExclusive = walLog.lastSequence() + 1;
+        }
+        for (WalEntry entry : walLog.readAll()) {
+            if (entry.sequence <= miniSqlEngine.engineWalSequence()) {
+                continue;
+            }
+            if (entry.sequence >= sequenceExclusive) {
+                break;
+            }
+            miniSqlEngine.executeStatement(entry.sql);
+            miniSqlEngine.setEngineWalSequence(entry.sequence);
         }
     }
 
@@ -342,6 +363,7 @@ public class DataNodeServer {
                 .forEach(appliedSql::add);
         snapshotManifest = snapshotManager.createSnapshot(compactThrough, currentShardLogIndexes(), appliedSql);
         walLog.compactThrough(compactThrough);
+        miniSqlEngine.invalidate();
         log("auto snapshot completed compactedWal=%d appliedSql=%d shardLogIndexes=%s",
                 snapshotManifest.lastCompactedWalSequence, appliedSql.size(), snapshotManifest.shardLogIndexes);
     }
