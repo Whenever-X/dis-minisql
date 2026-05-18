@@ -3,12 +3,14 @@ package edu.minisql.distributed;
 import edu.minisql.distributed.config.ClusterConfig;
 import edu.minisql.distributed.coordinator.CoordinatorCli;
 import edu.minisql.distributed.coordinator.CoordinatorServer;
+import edu.minisql.distributed.datanode.DataNodeCli;
 import edu.minisql.distributed.datanode.DataNodeServer;
 import edu.minisql.distributed.zk.ZkMetadataStore;
 
 import java.nio.file.Path;
 
 public class DisMiniSql {
+    @SuppressWarnings("resource")
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
             usage();
@@ -27,7 +29,11 @@ public class DisMiniSql {
                 if (args.length < 3) {
                     throw new IllegalArgumentException("datanode requires nodeId");
                 }
-                new DataNodeServer(config, args[2]).start();
+                DataNodeServer dataNode = new DataNodeServer(config, args[2]);
+                dataNode.start();
+                if (args.length >= 4 && "--cli".equals(args[3])) {
+                    new DataNodeCli(dataNode).run();
+                }
                 break;
             case "init-zk":
                 try (ZkMetadataStore store = new ZkMetadataStore(config)) {
@@ -45,6 +51,6 @@ public class DisMiniSql {
                 + "  java -jar target/dis-minisql-1.0.0.jar init-zk <config.json>\n"
                 + "  java -jar target/dis-minisql-1.0.0.jar coordinator <config.json>\n"
                 + "  java -jar target/dis-minisql-1.0.0.jar client <config.json>\n"
-                + "  java -jar target/dis-minisql-1.0.0.jar datanode <config.json> <nodeId>\n");
+                + "  java -jar target/dis-minisql-1.0.0.jar datanode <config.json> <nodeId> [--cli]\n");
     }
 }

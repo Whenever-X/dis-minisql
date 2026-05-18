@@ -31,39 +31,55 @@ public class MiniSqlCli {
         try {
             Files.createDirectories(workDir);
             Path execDir = Files.createTempDirectory(workDir, "minisql-exec-");
-            List<String> statements = new ArrayList<>();
-            for (String replay : replaySql) {
-                maybeUseDefaultDatabase(statements, replay);
-                statements.add(SqlUtils.normalize(replay));
+            try {
+                return runBatch(execDir, replaySql, sql);
+            } finally {
+                deleteDirectory(execDir);
             }
-            if (sql != null && !sql.isBlank()) {
-                maybeUseDefaultDatabase(statements, sql);
-                statements.add(SqlUtils.normalize(sql));
-            }
-            Path batchFile = Files.createTempFile(execDir, "minisql-batch-", ".sql");
-            Files.write(batchFile, statements, StandardCharsets.UTF_8);
-
-            Process process = new ProcessBuilder(binary.toString(), "--batch", batchFile.toString())
-                    .directory(execDir.toFile())
-                    .redirectErrorStream(true)
-                    .start();
-            boolean finished = process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                throw new IllegalStateException("MiniSQL execution timed out after " + timeout);
-            }
-            String output = readAll(process.getInputStream());
-            deleteDirectory(execDir);
-            if (process.exitValue() != 0) {
-                throw new IllegalStateException("MiniSQL exited with code " + process.exitValue() + "\n" + output);
-            }
-            return output;
         } catch (IOException e) {
             throw new IllegalStateException("Failed to start MiniSQL binary: " + binary, e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("MiniSQL execution interrupted", e);
         }
+    }
+
+    public synchronized String executeInDirectory(Path execDir, List<String> replaySql, String sql) {
+        try {
+            Files.createDirectories(execDir);
+            return runBatch(execDir, replaySql, sql);
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to start MiniSQL binary: " + binary, e);
+        }
+    }
+
+    private String runBatch(Path execDir, List<String> replaySql, String sql) throws IOException, InterruptedException {
+        List<String> statements = new ArrayList<>();
+        for (String replay : replaySql) {
+            maybeUseDefaultDatabase(statements, replay);
+            statements.add(SqlUtils.normalize(replay));
+        }
+        if (sql != null && !sql.isBlank()) {
+            maybeUseDefaultDatabase(statements, sql);
+            statements.add(SqlUtils.normalize(sql));
+        }
+        if (statements.isEmpty()) {
+            return "";
+        }
+        Path batchFile = Files.createTempFile(execDir, "minisql-batch-", ".sql");
+        Files.write(batchFile, statements, StandardCharsets.UTF_8);
+
+        Process process = new ProcessBuilder(binary.toString(), "--batch", batchFile.toString())
+                .directory(execDir.toFile())
+                .redirectErrorStream(true)
+                .start();
+        boolean finished = process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        if (!finished) {
+            process.destroyForcibly();
+            throw new IllegalStateException("MiniSQL execution timed out after " + timeout);
+        }
+        String output = readAll(process.getInputStream());
+        if (process.exitValue() != 0) {
+            throw new IllegalStateException("MiniSQL exited with code " + process.exitValue() + "\n" + output);
+        }
+        return output;
     }
 
     private String readAll(InputStream in) throws IOException {

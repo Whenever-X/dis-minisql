@@ -17,6 +17,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Locale;
@@ -145,29 +146,43 @@ public class CoordinatorCli {
     private void printSqlResponse(SqlResponse response) {
         if (!response.ok) {
             out.println("ERROR: " + response.error);
-            printNodeResponses(response);
+            printResponseSummary(response);
+            printMergedErrors(response);
             return;
         }
         out.println("OK: " + response.route);
         if (response.mergedOutput != null && !response.mergedOutput.isBlank()) {
             out.println(response.mergedOutput.stripTrailing());
+            printResponseSummary(response);
             return;
         }
-        printNodeResponses(response);
+        if (response.route != null && response.route.toLowerCase(Locale.ROOT).contains("read")) {
+            out.println("Empty result.");
+        }
+        printResponseSummary(response);
     }
 
-    private void printNodeResponses(SqlResponse response) {
+    private void printMergedErrors(SqlResponse response) {
+        Map<String, Integer> errors = new LinkedHashMap<>();
         for (ExecuteResponse nodeResponse : response.responses) {
-            String status = nodeResponse.ok ? "OK" : "ERROR";
-            out.printf("[%s] %s", nodeResponse.nodeId, status);
-            if (nodeResponse.error != null && !nodeResponse.error.isBlank()) {
-                out.print(": " + nodeResponse.error);
+            if (nodeResponse.ok) {
+                continue;
             }
-            out.println();
-            if (nodeResponse.output != null && !nodeResponse.output.isBlank()) {
-                out.println(nodeResponse.output.stripTrailing());
+            String error = nodeResponse.error == null ? "" : nodeResponse.error.strip();
+            if (!error.isBlank()) {
+                errors.merge(error, 1, Integer::sum);
             }
         }
+        errors.forEach((error, count) -> out.printf("Failure repeated on %d DataNode(s): %s%n", count, error));
+    }
+
+    private void printResponseSummary(SqlResponse response) {
+        if (response.responses == null || response.responses.isEmpty()) {
+            return;
+        }
+        long success = response.responses.stream().filter(nodeResponse -> nodeResponse.ok).count();
+        long failed = response.responses.size() - success;
+        out.printf("DataNode acknowledgements: %d ok, %d failed.%n", success, failed);
     }
 
     private void printHealth() {

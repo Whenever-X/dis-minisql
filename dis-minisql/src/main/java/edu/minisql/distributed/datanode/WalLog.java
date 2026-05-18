@@ -54,13 +54,20 @@ public class WalLog {
             return existing.get();
         }
         WalEntry localEntry = new WalEntry(
-                lastSequence + 1,
+                Math.max(lastSequence + 1, peerEntry.sequence),
                 peerEntry.requestId,
                 peerEntry.shardId,
                 peerEntry.shardLogIndex,
                 SqlUtils.normalize(peerEntry.sql),
                 peerEntry.timestampMillis);
         return appendRaw(localEntry);
+    }
+
+    public synchronized void advanceLastSequence(long sequence) {
+        if (sequence > lastSequence) {
+            lastSequence = sequence;
+            persistIndex();
+        }
     }
 
     public synchronized boolean containsRequestId(String requestId) {
